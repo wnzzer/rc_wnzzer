@@ -38,6 +38,7 @@ type Config struct {
 
 	CompactMinBytes  int64
 	CompactLiveRatio float64
+	StripThreshold   int
 
 	AllowPrivateHosts bool
 }
@@ -67,6 +68,7 @@ func Load() (Config, error) {
 		ShutdownGrace:     envDur("NOTIFY_SHUTDOWN_GRACE", 30*time.Second),
 		CompactMinBytes:   int64(envInt("NOTIFY_COMPACT_MIN_BYTES", 64<<20)),
 		CompactLiveRatio:  envFloat("NOTIFY_COMPACT_LIVE_RATIO", 0.5),
+		StripThreshold:    envInt("NOTIFY_COMPACT_STRIP_THRESHOLD", 1000),
 		AllowPrivateHosts: envBool("NOTIFY_ALLOW_PRIVATE_HOSTS", false),
 	}
 	if c.Workers < 1 {

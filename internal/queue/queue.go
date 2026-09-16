@@ -32,6 +32,9 @@ type Config struct {
 	// CompactLiveRatio 是触发压缩的冗余阈值：当「快照所需记录数 / 磁盘实际
 	// 记录数」低于它时压缩。0.5 表示「磁盘上有一半以上是冗余记录才值得重写」。
 	CompactLiveRatio float64
+	// StripThreshold 是「凭据清理」这条独立的压缩触发线：累计这么多已成功任务
+	// 的完整 Target 仍留在磁盘上时，即便没有空间收益也强制压缩一次。
+	StripThreshold int
 }
 
 // Queue 是内存状态 + WAL 的组合体。
@@ -45,6 +48,13 @@ type Queue struct {
 	idem   map[string]string      // 幂等键 -> 任务 ID
 	due    dueHeap                // 已排程、待投递
 	active int                    // 非终态任务数
+
+	// unstripped 是自上次压缩以来新增的已成功任务数。
+	//
+	// 它们的 enq 记录仍带着完整 Target（含供应商 Authorization），而磁盘上的
+	// 字节只能靠重写 journal 才能抹掉 —— 也就是只能靠压缩。没有这个计数，
+	// 凭据清理就只是"碰巧压缩了才会发生"，而不是一个有上界的保证。
+	unstripped int
 
 	// wake 用于在有新任务或排程提前时唤醒调度循环。容量 1 + 非阻塞发送，
 	// 使它成为一个「有事发生」的电平信号而非事件队列 —— 不会因为堆积而失真。
@@ -228,6 +238,7 @@ func (q *Queue) OnSuccess(t *model.Task, code int) error {
 	t.State = model.StateSucceeded
 	t.UpdatedAt = model.NowMS()
 	q.active--
+	q.unstripped++
 	return q.store.AppendDone(t.ID, t.Attempts, code)
 }
 

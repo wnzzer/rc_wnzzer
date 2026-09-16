@@ -62,6 +62,7 @@ func run() error {
 		RetentionMS:      cfg.Retention.Milliseconds(),
 		CompactMinBytes:  cfg.CompactMinBytes,
 		CompactLiveRatio: cfg.CompactLiveRatio,
+		StripThreshold:   cfg.StripThreshold,
 	}, wal, log)
 
 	// 启动即回放。这一步决定了「崩溃前收下的任务」能否回到队列 —— 承诺 C1 的下半段。

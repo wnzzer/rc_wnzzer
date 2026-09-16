@@ -40,22 +40,32 @@ func (q *Queue) purgeExpired() int {
 	return n
 }
 
-// maybeCompact 在「文件够大 **且** 冗余记录够多」时重写 journal。
+// maybeCompact 决定是否重写 journal。两条**独立**的触发线，满足其一即压缩。
 //
-// 关键在于「冗余」怎么量。初版用的是「终态记录占比」，那是**错的**：压缩的
-// 收益来自折叠同一个任务的多条 att 记录（重试 100 次 = 100 条 att，压缩后
-// 只剩 1 条），而这类记录对终态占比的贡献是 0。结果就是一个 99% 都是冗余
-// 重试记录的 journal 永远不会被压缩 —— 恰好漏掉了最该压缩的那种情况。
+// 线 1 —— 空间收益：文件够大，且冗余记录够多。
 //
-// 正确的量法是直接比较「快照需要多少条记录」与「磁盘上实际有多少条」。
-// 这个比值就是压缩收益本身，不需要任何间接推断。
+//	关键在于「冗余」怎么量。初版用的是「终态记录占比」，那是**错的**：压缩的收益
+//	来自折叠同一任务的多条 att 记录（重试 100 次 = 100 条 att，压缩后只剩 1 条），
+//	而这类记录对终态占比的贡献是 0。结果就是一个 99% 都是冗余重试记录的 journal
+//	永远不会被压缩 —— 恰好漏掉了最该压缩的那种情况。
+//	正确的量法是直接比较「快照需要多少条记录」与「磁盘上实际有多少条」。
+//
+// 线 2 —— 凭据清理：累计了足够多未瘦身的已成功任务。
+//
+//	成功任务的 enq 记录带着供应商的 Authorization，而磁盘上的字节**只能靠重写
+//	journal 抹掉**。若只有线 1，凭据清理就退化成「碰巧压缩了才会发生」：
+//	一个低冗余的 journal 可以让凭据安安稳稳躺满整个保留期。
+//	线 2 把它变成一个有上界的保证 —— 代价是偶尔做一次没有空间收益的压缩。
 func (q *Queue) maybeCompact() error {
 	st := q.store.Stats()
-	if st.Bytes < q.cfg.CompactMinBytes || st.Records == 0 {
+	if st.Records == 0 {
 		return nil
 	}
-	if float64(q.snapshotSize())/float64(st.Records) >= q.cfg.CompactLiveRatio {
-		return nil // 冗余不足，压缩省不下什么
+	spaceWin := st.Bytes >= q.cfg.CompactMinBytes &&
+		float64(q.snapshotSize())/float64(st.Records) < q.cfg.CompactLiveRatio
+	credsStale := q.cfg.StripThreshold > 0 && q.unstrippedCount() >= q.cfg.StripThreshold
+	if !spaceWin && !credsStale {
+		return nil
 	}
 	return q.Compact()
 }
@@ -68,10 +78,24 @@ func (q *Queue) snapshotSize() int64 {
 	return int64(len(q.tasks)) * 2
 }
 
+// unstrippedCount 返回自上次压缩以来新增的、凭据仍在磁盘上的已成功任务数。
+func (q *Queue) unstrippedCount() int {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.unstripped
+}
+
 // Compact 立即重写 journal。导出是为了让验收测试能确定性地触发它。
 func (q *Queue) Compact() error {
 	snap := q.snapshot()
-	return q.store.Compact(snap)
+	if err := q.store.Compact(snap); err != nil {
+		return err
+	}
+	// 快照已把成功任务瘦身，磁盘上不再有它们的凭据，计数归零。
+	q.mu.Lock()
+	q.unstripped = 0
+	q.mu.Unlock()
+	return nil
 }
 
 // snapshot 把当前内存状态编码成一串记录。

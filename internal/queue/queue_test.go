@@ -336,3 +336,140 @@ func TestCompact_RoundTrip(t *testing.T) {
 		t.Errorf("压缩回放后活跃任务数 = %d, 期望 1", q2.active)
 	}
 }
+
+// TestMaybeCompact_TwoIndependentTriggers 钉住压缩的两条触发线。
+//
+// 这两条线服务于**不同目的**，必须各自独立生效：
+//   - 空间收益线：冗余记录太多，压缩能省磁盘；
+//   - 凭据清理线：已成功任务的 Authorization 还留在盘上，压缩是唯一能抹掉它的手段。
+//
+// 只有线 1 时，凭据清理会退化成「碰巧压缩了才会发生」—— 一个低冗余的 journal
+// 可以让凭据安稳躺满整个保留期。这个测试就是防止有人日后把线 2 当成冗余优化删掉。
+func TestMaybeCompact_TwoIndependentTriggers(t *testing.T) {
+	setup := func(t *testing.T, tune func(*Config)) (*Queue, *store.WAL) {
+		t.Helper()
+		q, w := newTestQueue(t, t.TempDir())
+		tune(&q.cfg)
+		// 造一个已成功任务：它的 enq 记录带着完整 Target，躺在盘上。
+		tk := newTask("k-cred")
+		tk.Target.Headers = map[string]string{"Authorization": "Bearer SECRET-TOKEN"}
+		if _, _, err := q.Submit(tk); err != nil {
+			t.Fatal(err)
+		}
+		leased, _ := q.Lease(model.NowMS())
+		if err := q.OnSuccess(leased, 200); err != nil {
+			t.Fatal(err)
+		}
+		return q, w
+	}
+
+	onDisk := func(t *testing.T, w *store.WAL) bool {
+		t.Helper()
+		found := false
+		if err := w.Replay(func(r *store.Record) error {
+			if r.Task != nil && r.Task.Target.Headers["Authorization"] != "" {
+				found = true
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return found
+	}
+
+	t.Run("两条线都不满足时不压缩", func(t *testing.T) {
+		q, w := setup(t, func(c *Config) {
+			c.CompactMinBytes = 1 << 30 // 空间线关掉
+			c.StripThreshold = 100      // 凭据线阈值远未达到
+		})
+		defer w.Close()
+		if err := q.maybeCompact(); err != nil {
+			t.Fatal(err)
+		}
+		if !onDisk(t, w) {
+			t.Error("不该压缩却压缩了")
+		}
+	})
+
+	t.Run("仅凭据线满足也要压缩", func(t *testing.T) {
+		q, w := setup(t, func(c *Config) {
+			c.CompactMinBytes = 1 << 30 // 空间线明确关掉
+			c.StripThreshold = 1        // 只靠凭据线
+		})
+		defer w.Close()
+		if !onDisk(t, w) {
+			t.Fatal("前置条件不成立：凭据本来就不在盘上")
+		}
+		if err := q.maybeCompact(); err != nil {
+			t.Fatal(err)
+		}
+		if onDisk(t, w) {
+			t.Error("凭据线触发后，成功任务的 Authorization 仍留在磁盘上")
+		}
+		// 压缩后计数归零，不该反复触发。
+		if q.unstrippedCount() != 0 {
+			t.Errorf("压缩后 unstripped = %d, 期望 0", q.unstrippedCount())
+		}
+	})
+
+	t.Run("阈值为 0 表示关闭凭据线", func(t *testing.T) {
+		q, w := setup(t, func(c *Config) {
+			c.CompactMinBytes = 1 << 30
+			c.StripThreshold = 0
+		})
+		defer w.Close()
+		if err := q.maybeCompact(); err != nil {
+			t.Fatal(err)
+		}
+		if !onDisk(t, w) {
+			t.Error("阈值为 0 时不该压缩")
+		}
+	})
+
+	t.Run("死信的凭据不受凭据线影响", func(t *testing.T) {
+		q, w := newTestQueue(t, t.TempDir())
+		defer w.Close()
+		q.cfg.CompactMinBytes = 1 << 30
+		q.cfg.StripThreshold = 1
+
+		dead := newTask("k-dead-cred")
+		dead.Target.Headers = map[string]string{"Authorization": "Bearer DEAD-TOKEN"}
+		q.Submit(dead)
+		l1, _ := q.Lease(model.NowMS())
+		q.OnDead(l1, 400, "bad", "permanent_response")
+
+		// 再来一个成功任务把凭据线顶上去。
+		ok := newTask("k-ok-cred")
+		ok.Target.Headers = map[string]string{"Authorization": "Bearer OK-TOKEN"}
+		q.Submit(ok)
+		l2, _ := q.Lease(model.NowMS())
+		q.OnSuccess(l2, 200)
+
+		if err := q.maybeCompact(); err != nil {
+			t.Fatal(err)
+		}
+
+		var okCred, deadCred string
+		if err := w.Replay(func(r *store.Record) error {
+			if r.Task == nil {
+				return nil
+			}
+			switch r.ID {
+			case l1.ID:
+				deadCred = r.Task.Target.Headers["Authorization"]
+			case l2.ID:
+				okCred = r.Task.Target.Headers["Authorization"]
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if okCred != "" {
+			t.Errorf("成功任务的凭据未被清除: %q", okCred)
+		}
+		// 死信必须保留完整 Target，否则 /retry 无从重建请求。
+		if deadCred != "Bearer DEAD-TOKEN" {
+			t.Errorf("死信的凭据被误删了: %q —— /retry 将失效", deadCred)
+		}
+	})
+}

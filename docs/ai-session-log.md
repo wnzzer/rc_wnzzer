@@ -260,3 +260,42 @@
   和 R6 里那组「看起来合理但从不生效」的默认参数是同一种错误：
   **没有验算就当成了事实。**
 - **落到文件**：`README.md`、`AI_USAGE.md`、`docs/ai-session-log.md`
+
+
+---
+
+### R16 · 死信 e2e 测试，挖出一个「机会性的安全性质」
+- **人类输入**：追问死信在没有数据库的情况下怎么保存；确认"是不是只在内存里"；
+  要求用接收端模拟器补 e2e 测试。
+- **先澄清了一个误解**：死信是**双份**的 —— 磁盘上有 `enq`（完整 Target）+ `dead` 两条
+  记录，内存那份是索引，重启时从磁盘重建。之前说"7 天后消失"指的是保留期到期，
+  内存和磁盘一起清，不是"没落盘"。
+- **AI 产出**：三个 e2e 用例（接收端模拟器 `internal/testutil/mockvendor.go` 本来就有，
+  直接复用）：
+  1. `TestE2E_DeadLetterSurvivesKill9` —— 死信活过 `kill -9`，重投后供应商收到
+     **原封不动**的 body 与调用方自定义 header；
+  2. `TestE2E_DeadLetterSurvivesCompactionAndKill9` —— 死信**经过压缩**再崩溃，
+     仍能重建完整请求（防瘦身逻辑误伤死信，这类 bug 只在压缩发生过的机器上复现）；
+  3. `TestE2E_CompactionDropsSucceededCredentials` —— **直接读 journal 文件**，
+     断言成功任务的凭据串消失、死信的保留。
+- **三次失败，性质各不相同**：
+  1. **断言写错**（不是代码问题）：第一版要求"重启后死信不该被重新投递"，
+     但 D-005 明明白白写着 `dead` 记录不 fsync、丢失后会重跑一遍失败路径。
+     我写测试时凭直觉认为"死信是终态不该再动"，忘了自己做过的决策。
+     改为断言真实契约：额外投递有界（至多一次）且必然收敛。
+  2. **测试场景无效**：第三个用例最初只有一个一次就成功的任务，没有冗余，
+     压缩正确地不触发 —— 用例自己失去了意义。
+  3. **真实漏洞**（D-041）：修好场景后发现压缩**跑了**、凭据**还在**。
+     根因是 D-033 的安全性质搭在"空间收益"那条触发线上，成了**机会性**的 ——
+     低冗余的 journal 永远不压缩，凭据就躺满整个保留期。
+     加了一条独立的凭据清理触发线。
+- **过程中还犯了两个老毛病**：
+  - 又一次手写 `contains`/`indexOf`，而 `strings.Contains` 就在标准库里 ——
+    把"零第三方依赖"误解成"不用标准库"，这是第二次了；
+  - 又一次对 gofmt 重排过的结构体做字符串替换而没先读文件，导致
+    `StripThreshold` 两处 wiring 都没接上。**而 `go build` 照样通过** ——
+    缺失的字段默认零值，恰好被 `StripThreshold > 0` 这个守卫变成静默失效。
+    一个"安全的默认值"把配置错误藏了起来。
+- **关联决策**：[D-041](decisions.md#d-041)
+- **落到文件**：`test/acceptance/deadletter_test.go`、`internal/queue/{queue,maintain}.go`、
+  `internal/config/config.go`、`cmd/notifyd/main.go`、`internal/queue/queue_test.go`

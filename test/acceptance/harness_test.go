@@ -283,6 +283,18 @@ func (s *server) task(id string) taskResp {
 	return out
 }
 
+// taskOpt 查询任务，不存在时返回 false 而不是让测试失败。
+func (s *server) taskOpt(id string) (taskResp, bool) {
+	s.t.Helper()
+	code, raw := s.do(http.MethodGet, "/v1/notifications/"+id, nil)
+	if code != http.StatusOK {
+		return taskResp{}, false
+	}
+	var out taskResp
+	json.Unmarshal(raw, &out)
+	return out, true
+}
+
 // waitUntil 轮询直到 cond 为真或超时。返回是否成功。
 func waitUntil(d time.Duration, cond func() bool) bool {
 	deadline := time.Now().Add(d)
