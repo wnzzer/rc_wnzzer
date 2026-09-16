@@ -85,7 +85,7 @@ test/acceptance/      A1-A10 验收测试（启动真实进程 + kill -9）
 
 ## 3. 关键工程决策与取舍
 
-> 完整的 40 条决策记录（含 **29 条否决**）见 [`docs/decisions.md`](docs/decisions.md)。
+> 完整的 40 条决策记录（其中 **12 条状态为「已否决」**，另有 4 条采纳项内部记录了被否决的备选）见 [`docs/decisions.md`](docs/decisions.md)。
 > 这里只列最核心的五条。
 
 ### 3.1 投递语义：at-least-once，并写进对外契约
@@ -285,7 +285,7 @@ notifyd 内部的并发（32 worker + 共享队列 + 后台刷盘）。因此用
 | 文件 | 内容 |
 |---|---|
 | [`docs/spec.md`](docs/spec.md) | 技术规格，13 章。标注「实现阶段的修正」处保留了初稿判断与推翻理由 |
-| [`docs/decisions.md`](docs/decisions.md) | **40 条决策，其中 29 条否决**，每条含「重新引入时机」 |
+| [`docs/decisions.md`](docs/decisions.md) | **40 条决策，其中 12 条状态为「已否决」**，另有 4 条采纳项内部记录了被否决的备选方案；每条否决均含「重新引入时机」 |
 | [`AI_USAGE.md`](AI_USAGE.md) | 作业交付物：AI 帮了什么、哪些建议没采纳、哪些决策是我做的 |
 | [`docs/ai-session-log.md`](docs/ai-session-log.md) | 工作流水账（已脱敏），14 轮 |
 | [`CLAUDE.md`](CLAUDE.md) | 本仓库的协作工作流与脱敏纪律 |
@@ -297,6 +297,6 @@ notifyd 内部的并发（32 worker + 共享队列 + 后台刷盘）。因此用
 | 系统边界：做什么 / 明确不做什么 | 本文 §4，详见 [spec §2.2](docs/spec.md) |
 | 投递语义 | 本文 §3.1，详见 [spec §5](docs/spec.md) |
 | 外部系统长期不可用的策略 | 本文 §3.3 §3.4，详见 [spec §6](docs/spec.md) |
-| 哪些 AI 建议属过度设计、未采纳 | [AI_USAGE.md §2](AI_USAGE.md)，29 条完整记录在 decisions.md |
+| 哪些 AI 建议属过度设计、未采纳 | [AI_USAGE.md §2](AI_USAGE.md)，12 条完整否决记录在 decisions.md |
 | 未来演进路线 | 本文 §6 |
 | 用 / 不用中间件的理由与替代方案 | 本文 §3.5，详见 [D-018](docs/decisions.md#d-018) [D-019](docs/decisions.md#d-019) |
