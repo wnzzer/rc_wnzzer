@@ -1,6 +1,7 @@
 # notifyd —— 外部通知可靠投递服务 · 技术规格 v1
 
-> 状态：**待评审**（v1 设计冻结前的最后一稿）
+> 状态：**已实现**。文中标注「实现阶段的修正」之处，是写代码或写测试时
+> 推翻了设计初稿的判断 —— 保留原判断与修正理由，而不是抹掉重写。
 > 配套文档：`docs/decisions.md`（取舍与否决记录）、`docs/ai-session-log.md`（工作流水账）
 
 ---
@@ -324,6 +325,7 @@ base = 1s,  cap = 1h,  max_attempts = 24
 | `3xx` | **永久失败** | 不跟随重定向，见下 |
 | 连接被拒 / DNS 失败 / TLS 握手失败 / 超时 | 可重试 | 退避 |
 | 目标 IP 命中 SSRF 黑名单 | 永久失败 | → `dead`，原因 `blocked_target` |
+| 任务描述不可投递（`body_encoding` 非法等） | 永久失败 | → `dead`，原因 `bad_request_spec` |
 
 **为什么 `401/403` 归为永久失败：** 凭据错误重试 24 次也不会变对，只会在对端留下一串
 认证失败记录，可能触发账号锁定。正确的处理是立即进死信 + 告警，让人去换凭据。
@@ -458,7 +460,16 @@ append-only + 单写者模式下唯一可能的损坏形态，由 JSON 解析失
 
 ### 7.4 压缩（compaction）
 
-触发条件（同时满足）：`文件 > 64MB` **且** `终态记录占比 > 50%`。
+触发条件（同时满足）：`文件 > 64MB` **且** `冗余记录占比 > 50%`。
+
+> **实现阶段的修正。** 初稿写的是「终态记录占比 > 50%」，写验收测试 A9 时发现这
+> **量错了东西**：压缩的收益来自折叠同一任务的多条 `att` 记录（重试 100 次 =
+> 100 条 `att`，压缩后只剩 1 条），而这类记录对「终态占比」的贡献是 **0**。
+> 结果就是一个 99% 都是冗余重试记录的 journal 永远不会被压缩 —— 恰好漏掉了
+> 最该压缩的那种情况。
+>
+> 正确的量法是直接比较「快照需要多少条记录」（≈ 任务数 × 2）与「磁盘上实际
+> 有多少条」。这个比值就是压缩收益本身，不需要任何间接推断。
 
 ```
 1. 持写锁（阻塞新的 enq，毫秒 ~ 数百毫秒级）
@@ -476,6 +487,18 @@ append-only + 单写者模式下唯一可能的损坏形态，由 JSON 解析失
 
 **已知限制：** 压缩期间阻塞写入。v1 接受（预期百毫秒级）。改成无阻塞需要双写新旧文件，
 复杂度翻倍，收益在当前量级下不存在。
+
+#### 7.4.1 终态任务的「瘦墓碑」
+
+压缩时，**成功**任务只保留一个瘦墓碑：丢掉 `Headers` 与 `Body`，保留 `URL` 与 `Method`。
+
+这不只是省体积（虽然省得很多）。`Headers` 里装着**供应商的 `Authorization` 凭据** ——
+一个已经投递成功的任务，没有任何理由把别人的 token 在磁盘上再留 7 天。压缩顺带
+把这个暴露面清掉。保留 URL 与 Method 是因为它们不敏感，而排障时「这条通知发去了
+哪」是最常被问到的问题。
+
+**死信任务必须保留完整 `Target`** —— 否则 `POST /{id}/retry` 无从重建请求。
+代价是死信会在磁盘上持有供应商凭据直到过保留期，已列入 §11。
 
 ### 7.5 内存结构
 
@@ -533,22 +556,30 @@ notifyd_oldest_pending_age_seconds                                     gauge
 
 ## 10. 配置与运维
 
-全部通过环境变量（零依赖，不引入配置解析库）：
+全部通过环境变量（零依赖，不引入配置解析库）。时长类一律用 Go duration 字面量
+（`5s` / `1h` / `200ms`）：
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `NOTIFY_ADDR` | `:8080` | 监听地址 |
 | `NOTIFY_DATA_DIR` | `./data` | journal 目录 |
-| `NOTIFY_KEYS_FILE` | `./keys` | `key_id:secret` 每行一条，权限需 0600 |
+| `NOTIFY_KEYS_FILE` | `./keys` | `key_id:secret` 每行一条，**权限必须 0600，否则拒绝启动** |
 | `NOTIFY_WORKERS` | `32` | worker 池大小 |
 | `NOTIFY_HOST_CONCURRENCY` | `8` | 单目标主机并发上限 |
+| `NOTIFY_QUEUE_MAX` | `100000` | 活跃任务上限，超过返回 429 |
 | `NOTIFY_MAX_ATTEMPTS` | `24` | 默认重试上限（约覆盖 12.1h 宕机，见 §6.1） |
+| `NOTIFY_BACKOFF_BASE` | `1s` | 退避基数 |
 | `NOTIFY_BACKOFF_CAP` | `1h` | 退避窗口封顶 |
-| `NOTIFY_TIMEOUT_MS` | `5000` | 默认单次投递超时 |
-| `NOTIFY_DEADLINE_MS` | `86400000` | 默认绝对放弃时限 |
-| `NOTIFY_QUEUE_MAX` | `100000` | 活跃任务上限 |
-| `NOTIFY_RETENTION_DAYS` | `7` | 终态保留期 = 幂等窗口 |
-| `NOTIFY_ALLOW_PRIVATE_HOSTS` | `false` | 关闭 SSRF 防护（仅联调） |
+| `NOTIFY_TIMEOUT` | `5s` | 默认单次投递超时 |
+| `NOTIFY_DEADLINE` | `24h` | 默认绝对放弃时限 |
+| `NOTIFY_DIAL_TIMEOUT` | `5s` | 建连超时 |
+| `NOTIFY_RETENTION` | `168h` | 终态保留期 = 幂等窗口 |
+| `NOTIFY_MAINTAIN_INTERVAL` | `1m` | 清理 + 压缩检查周期 |
+| `NOTIFY_SKEW_TOLERANCE` | `5m` | 签名时间戳容忍窗口 |
+| `NOTIFY_SHUTDOWN_GRACE` | `30s` | 退出宽限期 |
+| `NOTIFY_COMPACT_MIN_BYTES` | `67108864` | 触发压缩的最小文件体积 |
+| `NOTIFY_COMPACT_LIVE_RATIO` | `0.5` | 冗余阈值：快照所需记录数 / 实际记录数低于它才压缩 |
+| `NOTIFY_ALLOW_PRIVATE_HOSTS` | `false` | 关闭 SSRF 防护（**仅联调**，同时作用于提交预检与 Dial 层） |
 
 **优雅退出（SIGTERM）：**
 
@@ -574,6 +605,9 @@ notifyd_oldest_pending_age_seconds                                     gauge
 6. **幂等窗口 = 7 天。** 超窗重投会产生新任务。§8 / B8
 7. **无投递顺序保证。** B2
 8. **内存与磁盘随活跃任务线性增长**，靠 `NOTIFY_QUEUE_MAX` 兜底。§7.6
+9. **死信在磁盘上保留供应商凭据**直到过保留期。这是 `/retry` 能重建请求的前提，
+   是一个明确的取舍而非疏忽。成功任务的凭据在压缩时即被清除。§7.4.1
+10. **压缩持写锁**，期间提交被阻塞（预期百毫秒级）。§7.4
 
 ---
 
@@ -628,3 +662,21 @@ notifyd_oldest_pending_age_seconds                                     gauge
 
 A2 / A8 需要一个**可编程的 mock 供应商**（stdlib `net/http/httptest`，零依赖），
 可配置返回码、延迟、恢复时间。它是测试基础设施，不进生产二进制。
+
+### 13.1 实现状态
+
+A1-A10 **已全部实现并通过**，见 `test/acceptance/`。它们启动**真实的 notifyd 进程**
+并对其发起真实 HTTP 请求 —— 因为要验证的正是「进程被 `kill -9` 之后会怎样」这类
+单元测试够不到的性质。
+
+补充用例（超出 A1-A10）：
+
+| 用例 | 验证内容 |
+|---|---|
+| `TestA6b_SignatureCoversBody` | 用原始 body 的签名发送被篡改的 body（把目标 URL 换成攻击者地址）必须 401 |
+| `TestStableNotifyID` | 同一任务的所有重试携带**恒定不变**的 `X-Notify-Id`，`X-Notify-Attempt` 递增 |
+| `TestDeadLetterRetry` | 死信可查询、可手工重投，重投后能成功 |
+
+**竞态检测：** `go test ./... -race` 时，验收测试会用 `-race` 重新构建被测二进制。
+这一点容易被忽略 —— 验收测试启动的是**独立进程**，只给测试二进制开 `-race` 检测不到
+notifyd 内部的并发，而那才是真正需要被检测的地方（多 worker + 共享队列 + 后台刷盘）。

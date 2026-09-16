@@ -4,6 +4,8 @@
 #
 # 两类规则：
 #   1. 通用模式（写死在本脚本里）—— 邮箱、私网 IP、本机家目录路径、常见密钥形态。
+#   豁免：行内写 `redact-ok: <理由>` 可跳过该行（理由必填，便于 review）。
+#
 #   2. 项目私有词表 —— 真实公司名/内网域名等本身就是敏感词，不能写进公开仓库。
 #      放在 scripts/redact-patterns.local（已 gitignore），每行一个 ERE。
 #
@@ -32,6 +34,13 @@ scan() {
   # scan <标签> <命中模式ERE> [<白名单模式ERE，命中则忽略该行>]
   local label="$1" pattern="$2" allow="${3:-}" hits
   hits=$(files | xargs -I{} grep -nE -- "$pattern" {} /dev/null 2>/dev/null || true)
+  # 显式豁免：行内带 `redact-ok: <理由>` 标记的行跳过。
+  # 用标记而不是「排除 *_test.go」这类整类豁免 —— 测试文件同样可能夹带真实
+  # 内网地址，整类放行等于在最容易疏忽的地方关掉检查。标记强制写明理由，
+  # 也让 code review 能看见每一次豁免。
+  if [ -n "$hits" ]; then
+    hits=$(printf '%s\n' "$hits" | grep -v 'redact-ok' || true)
+  fi
   if [ -n "$hits" ] && [ -n "$allow" ]; then
     hits=$(printf '%s\n' "$hits" | grep -vE -- "$allow" || true)
   fi
