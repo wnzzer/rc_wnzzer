@@ -88,6 +88,7 @@ type taskView struct {
 	NextAt     int64       `json:"next_attempt_at,omitempty"`
 	LastCode   int         `json:"last_status_code,omitempty"`
 	LastErr    string      `json:"last_error,omitempty"`
+	LastResp   string      `json:"last_response,omitempty"`
 	DeadReason string      `json:"dead_reason,omitempty"`
 	CreatedAt  int64       `json:"created_at"`
 	UpdatedAt  int64       `json:"updated_at"`
@@ -98,7 +99,7 @@ func viewOf(t model.Task) taskView {
 	return taskView{
 		ID: t.ID, IdemKey: t.IdemKey, State: t.State, URL: t.Target.URL,
 		Attempts: t.Attempts, NextAt: t.NextAt, LastCode: t.LastCode,
-		LastErr: t.LastErr, DeadReason: t.DeadReason,
+		LastErr: t.LastErr, LastResp: t.LastResp, DeadReason: t.DeadReason,
 		CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt, KeyID: t.KeyID,
 	}
 }

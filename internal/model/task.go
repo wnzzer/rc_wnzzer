@@ -62,6 +62,7 @@ type Task struct {
 	UpdatedAt  int64  `json:"-"`
 	LastCode   int    `json:"-"`
 	LastErr    string `json:"-"`
+	LastResp   string `json:"-"` // 最近一次响应体摘要（成功与失败都留），仅供排障
 	DeadReason string `json:"-"`
 }
 

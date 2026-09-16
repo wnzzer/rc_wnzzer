@@ -54,7 +54,7 @@ func TestWAL_AppendAndReplay(t *testing.T) {
 	if err := w.AppendAttempt("T1", 1, ResRetry, 503, "boom", 1700000001000); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.AppendDone("T1", 2, 200); err != nil {
+	if err := w.AppendDone("T1", 2, 200, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.Close(); err != nil {
@@ -150,7 +150,7 @@ func TestWAL_RepairsTruncatedTail(t *testing.T) {
 			}
 
 			// 修复必须是持久的：文件已被截断，且后续写入能正常接上。
-			if err := w2.AppendDone("T1", 1, 200); err != nil {
+			if err := w2.AppendDone("T1", 1, 200, ""); err != nil {
 				t.Fatal(err)
 			}
 			if err := w2.Close(); err != nil {
@@ -175,7 +175,7 @@ func TestWAL_Compact(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := w.AppendDone("T1", 1, 200); err != nil {
+	if err := w.AppendDone("T1", 1, 200, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.AppendDead("T2", 24, "max_attempts"); err != nil {

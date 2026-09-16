@@ -197,7 +197,12 @@ func (d *Dispatcher) deliver(t *model.Task) {
 	defer cancel()
 
 	start := time.Now()
-	code, hdr, errMsg, err := d.doRequest(ctx, t, attempt)
+	code, hdr, snippet, err := d.doRequest(ctx, t, attempt)
+	// 同一段响应摘要，在成功路径叫「响应」，在失败路径叫「错误」。
+	errMsg := snippet
+	if err == nil && Classify(code, nil) == OutcomeSuccess {
+		errMsg = ""
+	}
 	elapsed := time.Since(start)
 
 	outcome := Classify(code, err)
@@ -209,7 +214,7 @@ func (d *Dispatcher) deliver(t *model.Task) {
 
 	switch outcome {
 	case OutcomeSuccess:
-		if err := d.q.OnSuccess(t, code); err != nil {
+		if err := d.q.OnSuccess(t, code, snippet); err != nil {
 			lg.Error("记录投递成功失败", "err", err)
 		}
 		lg.Info("投递成功")
@@ -300,11 +305,9 @@ func (d *Dispatcher) doRequest(ctx context.Context, t *model.Task, attempt int) 
 
 	snippet, _ := io.ReadAll(io.LimitReader(resp.Body, bodySnippetMax))
 	_, _ = io.CopyN(io.Discard, resp.Body, bodyDrainMax) // 读完才能复用连接
-	msg := ""
-	if Classify(resp.StatusCode, nil) != OutcomeSuccess {
-		msg = string(snippet)
-	}
-	return resp.StatusCode, resp.Header, msg, nil
+	// 成功与失败都返回摘要。成功时它一样有价值：不少供应商用 200 包裹业务错误，
+	// 把已经读到的这几百字节扔掉，会让那类故障完全不可排查（见 Queue.OnSuccess）。
+	return resp.StatusCode, resp.Header, string(snippet), nil
 }
 
 func decodeBody(tg model.Target) ([]byte, error) {

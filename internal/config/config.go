@@ -23,6 +23,7 @@ type Config struct {
 	Workers         int
 	HostConcurrency int
 	QueueMax        int
+	TasksMax        int
 
 	MaxAttempts int
 	BaseBackoff time.Duration
@@ -32,6 +33,7 @@ type Config struct {
 	DialTimeout time.Duration
 
 	Retention        time.Duration
+	DeadRetention    time.Duration
 	MaintainInterval time.Duration
 	SkewTolerance    time.Duration
 	ShutdownGrace    time.Duration
@@ -56,6 +58,7 @@ func Load() (Config, error) {
 		Workers:           envInt("NOTIFY_WORKERS", 32),
 		HostConcurrency:   envInt("NOTIFY_HOST_CONCURRENCY", 8),
 		QueueMax:          envInt("NOTIFY_QUEUE_MAX", 100_000),
+		TasksMax:          envInt("NOTIFY_TASKS_MAX", 500_000),
 		MaxAttempts:       envInt("NOTIFY_MAX_ATTEMPTS", 24),
 		BaseBackoff:       envDur("NOTIFY_BACKOFF_BASE", time.Second),
 		BackoffCap:        envDur("NOTIFY_BACKOFF_CAP", time.Hour),
@@ -63,6 +66,7 @@ func Load() (Config, error) {
 		Deadline:          envDur("NOTIFY_DEADLINE", 24*time.Hour),
 		DialTimeout:       envDur("NOTIFY_DIAL_TIMEOUT", 5*time.Second),
 		Retention:         envDur("NOTIFY_RETENTION", 7*24*time.Hour),
+		DeadRetention:     envDur("NOTIFY_DEAD_RETENTION", 30*24*time.Hour),
 		MaintainInterval:  envDur("NOTIFY_MAINTAIN_INTERVAL", time.Minute),
 		SkewTolerance:     envDur("NOTIFY_SKEW_TOLERANCE", 5*time.Minute),
 		ShutdownGrace:     envDur("NOTIFY_SHUTDOWN_GRACE", 30*time.Second),
@@ -79,6 +83,16 @@ func Load() (Config, error) {
 	}
 	if c.MaxAttempts < 1 {
 		return c, fmt.Errorf("config: NOTIFY_MAX_ATTEMPTS 必须 >= 1")
+	}
+	// 总量上限必须容得下活跃任务，否则清理逻辑会在「全是活跃任务」时陷入
+	// 每个周期都报警却清不掉任何东西的状态。宁可启动失败，也不要静默地半失效。
+	if c.TasksMax > 0 && c.TasksMax < c.QueueMax {
+		return c, fmt.Errorf("config: NOTIFY_TASKS_MAX (%d) 不能小于 NOTIFY_QUEUE_MAX (%d)",
+			c.TasksMax, c.QueueMax)
+	}
+	if c.DeadRetention < c.Retention {
+		return c, fmt.Errorf("config: NOTIFY_DEAD_RETENTION (%s) 不应短于 NOTIFY_RETENTION (%s) —— 死信比成功记录更值得留",
+			c.DeadRetention, c.Retention)
 	}
 	return c, nil
 }

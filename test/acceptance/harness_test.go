@@ -245,6 +245,7 @@ type taskResp struct {
 	Attempts   int    `json:"attempts"`
 	NextAt     int64  `json:"next_attempt_at"`
 	LastCode   int    `json:"last_status_code"`
+	LastResp   string `json:"last_response"`
 	DeadReason string `json:"dead_reason"`
 }
 

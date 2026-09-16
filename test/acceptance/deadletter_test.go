@@ -370,3 +370,39 @@ func TestE2E_CompactionDropsSucceededCredentials(t *testing.T) {
 		t.Error("重投的请求没有携带原始凭据 —— Target 未被完整保留")
 	}
 }
+
+// TestE2E_SuccessResponseIsQueryable 验证「200 包裹业务错误」这类故障可排查。
+//
+// notifyd 按 2xx 判成功是有意的窄定义（边界 B3）—— 不解析响应体，也就没有
+// 解析器攻击面，更不必理解每家供应商的业务语义。但**判定不看** ≠ **信息要扔**：
+// 那几百字节在 doRequest 里本来就已经读进内存了。
+//
+// 扔掉它的代价很具体：运营说「CRM 状态没变」，而排障的人只能看到一个孤零零的
+// 200，无从查起。留下它不改变任何判定逻辑，只是别把手里的信息丢了。
+func TestE2E_SuccessResponseIsQueryable(t *testing.T) {
+	v := testutil.NewVendor()
+	defer v.Close()
+	v.SetStatus(http.StatusOK) // HTTP 成功……
+
+	s := newServer(t).start()
+	got := submitWithHeaders(s, "resp-visible", v.URL(), http.StatusAccepted)
+	if !waitUntil(10*time.Second, func() bool { return s.task(got.ID).State == "succeeded" }) {
+		t.Fatalf("任务未成功: %+v", s.task(got.ID))
+	}
+
+	// mock 供应商固定返回 {"ok":true}；真实场景里这里会是 {"code":40001,...}。
+	after := s.task(got.ID)
+	if after.LastResp == "" {
+		t.Fatal("成功任务的响应摘要为空 —— 200 包裹业务错误的故障将完全不可排查")
+	}
+	if !strings.Contains(after.LastResp, `"ok":true`) {
+		t.Errorf("响应摘要 = %q, 未包含供应商实际返回的内容", after.LastResp)
+	}
+
+	// 摘要要活过重启 —— 排障通常发生在事故之后，而事故常伴随重启。
+	s.kill9()
+	s.start()
+	if restored := s.task(got.ID).LastResp; restored != after.LastResp {
+		t.Errorf("重启后响应摘要 = %q, 崩溃前 = %q", restored, after.LastResp)
+	}
+}

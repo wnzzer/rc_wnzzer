@@ -37,6 +37,7 @@ type Record struct {
 	Res    string `json:"res,omitempty"`  // 仅 att
 	Code   int    `json:"code,omitempty"` // HTTP 状态码，0 表示未拿到响应
 	Err    string `json:"err,omitempty"`  // 错误摘要（已截断）
+	Resp   string `json:"resp,omitempty"` // 成功响应体摘要（已截断），压缩时丢弃
 	NextAt int64  `json:"next,omitempty"` // 仅 att：下次投递时刻
 	Why    string `json:"why,omitempty"`  // 仅 dead：放弃原因
 }
@@ -63,8 +64,8 @@ type Store interface {
 	// AppendAttempt 记录一次失败的投递尝试及下次投递时刻。不保证立即落盘。
 	AppendAttempt(id string, n int, res string, code int, errMsg string, nextAt int64) error
 
-	// AppendDone 记录投递成功。不保证立即落盘。
-	AppendDone(id string, n, code int) error
+	// AppendDone 记录投递成功。resp 是响应体摘要，仅供排障。不保证立即落盘。
+	AppendDone(id string, n, code int, resp string) error
 
 	// AppendDead 记录放弃投递。不保证立即落盘。
 	AppendDead(id string, n int, why string) error

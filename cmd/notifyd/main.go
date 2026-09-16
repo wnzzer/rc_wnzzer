@@ -59,7 +59,9 @@ func run() error {
 
 	q := queue.New(queue.Config{
 		QueueMax:         cfg.QueueMax,
+		TasksMax:         cfg.TasksMax,
 		RetentionMS:      cfg.Retention.Milliseconds(),
+		DeadRetentionMS:  cfg.DeadRetention.Milliseconds(),
 		CompactMinBytes:  cfg.CompactMinBytes,
 		CompactLiveRatio: cfg.CompactLiveRatio,
 		StripThreshold:   cfg.StripThreshold,

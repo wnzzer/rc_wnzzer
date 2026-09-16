@@ -157,8 +157,11 @@ func (w *WAL) AppendAttempt(id string, n int, res string, code int, errMsg strin
 	}, false)
 }
 
-func (w *WAL) AppendDone(id string, n, code int) error {
-	return w.append(&Record{T: RecDone, ID: id, TS: model.NowMS(), N: n, Code: code}, false)
+func (w *WAL) AppendDone(id string, n, code int, resp string) error {
+	return w.append(&Record{
+		T: RecDone, ID: id, TS: model.NowMS(), N: n, Code: code,
+		Resp: truncate(resp, errFieldMax),
+	}, false)
 }
 
 func (w *WAL) AppendDead(id string, n int, why string) error {

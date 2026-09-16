@@ -26,8 +26,20 @@ var (
 
 // Config 是队列的容量与保留策略。
 type Config struct {
-	QueueMax        int   // 活跃（非终态）任务上限
-	RetentionMS     int64 // 终态任务保留时长；同时也是幂等去重窗口
+	QueueMax int // 活跃（非终态）任务上限
+	// TasksMax 是内存中任务总数（含保留期内的终态墓碑）的上限。
+	//
+	// QueueMax 只管活跃任务，挡不住墓碑：终态任务会 active--，于是
+	// 「提交 10 万 → 全部终结 → 再提交 10 万」可以让 map 无限涨下去。
+	// 保留期 × 持续流量在设计自己声明的目标量级上就已经是 GB 级了。
+	TasksMax int
+	// RetentionMS 是**成功**任务的保留时长，同时也是幂等去重窗口。
+	RetentionMS int64
+	// DeadRetentionMS 是**死信**的保留时长，通常应显著长于 RetentionMS。
+	//
+	// 成功任务留着只是为了幂等去重，7 天够了；而死信代表「有一条通知确实
+	// 没发出去」，它是需要人来处理的**证据**，和成功任务同寿没有道理。
+	DeadRetentionMS int64
 	CompactMinBytes int64 // 触发压缩的最小文件体积
 	// CompactLiveRatio 是触发压缩的冗余阈值：当「快照所需记录数 / 磁盘实际
 	// 记录数」低于它时压缩。0.5 表示「磁盘上有一半以上是冗余记录才值得重写」。
@@ -119,8 +131,11 @@ func (q *Queue) Restore() error {
 			if t, ok := q.tasks[r.ID]; ok {
 				t.Attempts = r.N
 				t.LastCode = r.Code
+				t.LastResp = r.Resp
 				t.State = model.StateSucceeded
 				t.UpdatedAt = r.TS
+				// 与 OnSuccess 保持一致：成功任务在内存中不持有凭据。
+				t.Target = model.Target{URL: t.Target.URL, Method: t.Target.Method}
 			}
 		case store.RecDead:
 			if t, ok := q.tasks[r.ID]; ok {
@@ -227,19 +242,34 @@ func (q *Queue) OnRetry(t *model.Task, code int, errMsg string, nextAt int64) er
 	return nil
 }
 
-// OnSuccess 把任务置为成功终态。
-func (q *Queue) OnSuccess(t *model.Task, code int) error {
+// OnSuccess 把任务置为成功终态，并保存响应体摘要。
+//
+// 为什么成功也要留响应摘要：不少供应商用 HTTP 200 包裹业务错误
+// （`200 {"code":40001,"msg":"contact not found"}`）。notifyd 按 2xx 判成功是
+// 有意的窄定义（边界 B3），但把已经读到的那几百字节直接扔掉，会让这类故障
+// **完全不可排查** —— 运营说「CRM 状态没变」，而你只能看到一个孤零零的 200。
+// 留下它不改变任何判定逻辑，只是别把手里的信息丢了。
+//
+// 同时**立刻**从内存中抹掉 Headers/Body：
+//   - 安全：Headers 里是供应商的 Authorization，成功之后没有任何理由继续持有；
+//   - 内存：墓碑要在内存里待满整个保留期，而 Headers/Body 往往是任务里最大的部分。
+//
+// 磁盘上的那份要等压缩才能抹掉（字节只能靠重写 journal 消除，见 D-041），
+// 但内存这份可以立即清 —— 没有理由等。
+func (q *Queue) OnSuccess(t *model.Task, code int, resp string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	t.Attempts++
 	t.LastCode = code
 	t.LastErr = ""
+	t.LastResp = resp
 	t.State = model.StateSucceeded
 	t.UpdatedAt = model.NowMS()
+	t.Target = model.Target{URL: t.Target.URL, Method: t.Target.Method}
 	q.active--
 	q.unstripped++
-	return q.store.AppendDone(t.ID, t.Attempts, code)
+	return q.store.AppendDone(t.ID, t.Attempts, code, resp)
 }
 
 // OnDead 放弃任务并进入死信。code/errMsg 用于保留最后一次失败的现场。

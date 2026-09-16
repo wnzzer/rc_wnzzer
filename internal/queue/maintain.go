@@ -1,6 +1,8 @@
 package queue
 
 import (
+	"sort"
+
 	"github.com/wnzzer/rc_wnzzer/internal/model"
 	"github.com/wnzzer/rc_wnzzer/internal/store"
 )
@@ -11,33 +13,116 @@ func (q *Queue) Maintain() {
 	if n := q.purgeExpired(); n > 0 {
 		q.log.Info("清理过期终态任务", "数量", n)
 	}
+	if n := q.enforceTaskCap(); n > 0 {
+		q.log.Warn("任务总数超过上限，已提前清理最老的终态任务",
+			"清理数量", n, "上限", q.cfg.TasksMax)
+	}
 	if err := q.maybeCompact(); err != nil {
 		q.log.Error("压缩 journal 失败", "err", err)
 	}
 }
 
-// purgeExpired 移除超出保留期的终态任务。
+// purgeExpired 移除超出保留期的终态任务。**成功任务与死信用不同的保留期。**
 //
-// 副作用（spec §8 / 边界 B8）：幂等去重窗口 = 保留期。任务被清理后，同一个
-// idempotency_key 再次提交会被当作新任务。这个限制必须写进 API 文档，
+// 成功任务留着只为幂等去重，默认 7 天；死信代表「有一条通知确实没发出去」，
+// 是需要人来处理的证据，默认 30 天。让两者同寿没有道理 —— 而最初的实现
+// 恰恰是 `if t.State.Terminal()` 一视同仁。
+//
+// 副作用（spec §8 / 边界 B8）：幂等去重窗口 = 成功任务的保留期。任务被清理后，
+// 同一个 idempotency_key 再次提交会被当作新任务。这个限制必须写进 API 文档，
 // 而不是留给调用方去踩。
 func (q *Queue) purgeExpired() int {
-	cutoff := model.NowMS() - q.cfg.RetentionMS
+	now := model.NowMS()
+	okCutoff := now - q.cfg.RetentionMS
+	deadCutoff := now - q.cfg.DeadRetentionMS
+
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	n := 0
 	for id, t := range q.tasks {
-		if !t.State.Terminal() || t.UpdatedAt >= cutoff {
+		cutoff := okCutoff
+		switch t.State {
+		case model.StateSucceeded:
+		case model.StateDead:
+			cutoff = deadCutoff
+		default:
+			continue // 未终结，不清理
+		}
+		if t.UpdatedAt >= cutoff {
 			continue
 		}
-		delete(q.tasks, id)
-		if t.IdemKey != "" && q.idem[t.IdemKey] == id {
-			delete(q.idem, t.IdemKey)
-		}
+		q.dropLocked(id, t)
 		n++
 	}
 	return n
+}
+
+// enforceTaskCap 在任务总数超过上限时，提前清理最老的终态任务。
+//
+// 为什么需要它：QueueMax 只管**活跃**任务，而终态任务会 active--。于是
+// 「提交 10 万 → 全部终结 → 再提交 10 万」可以让 map 一直涨，QueueMax 完全挡不住。
+// 按 spec 自己声明的目标量级（日均百万级 × 7 天保留）算就已经是 GB 级内存了。
+// 这正是决策 D-017「早拒绝好过晚 OOM」想防的事，只是当初只堵了活跃任务那条路。
+//
+// 清理顺序是有讲究的：**先牺牲成功任务，再动死信**。
+// 成功墓碑丢了只是幂等窗口提前关闭（重复提交会产生新任务，仍落在 at-least-once 内）；
+// 死信丢了则是**永久失去一条通知没送达的证据**，没有任何补救手段。
+//
+// 已知限制：只在维护周期（默认 1 分钟）执行，两次之间总数可能短暂超过上限。
+// 对一个内存兜底而言这个精度足够；要做成硬上限需要在提交路径上加检查，
+// 而那会把一个后台清理问题变成一个请求路径上的锁竞争问题。
+func (q *Queue) enforceTaskCap() int {
+	if q.cfg.TasksMax <= 0 {
+		return 0
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	over := len(q.tasks) - q.cfg.TasksMax
+	if over <= 0 {
+		return 0
+	}
+
+	type victim struct {
+		id     string
+		t      *model.Task
+		isDead bool
+	}
+	cands := make([]victim, 0, len(q.tasks))
+	for id, t := range q.tasks {
+		if !t.State.Terminal() {
+			continue // 活跃任务不能丢 —— 那是承诺 C1 的范围
+		}
+		cands = append(cands, victim{id, t, t.State == model.StateDead})
+	}
+	// 成功任务排在死信前面；同类中按最后更新时间从旧到新。
+	sort.Slice(cands, func(i, j int) bool {
+		if cands[i].isDead != cands[j].isDead {
+			return !cands[i].isDead
+		}
+		return cands[i].t.UpdatedAt < cands[j].t.UpdatedAt
+	})
+
+	n := 0
+	for _, c := range cands {
+		if n >= over {
+			break
+		}
+		q.dropLocked(c.id, c.t)
+		n++
+	}
+	// 若清空全部终态任务仍然超限，说明活跃任务自己就超了上限 —— 那是配置问题
+	// （TasksMax < QueueMax），已在启动时校验，这里不再处理。
+	return n
+}
+
+// dropLocked 从内存中移除一个任务及其幂等索引。调用方必须持有写锁。
+func (q *Queue) dropLocked(id string, t *model.Task) {
+	delete(q.tasks, id)
+	if t.IdemKey != "" && q.idem[t.IdemKey] == id {
+		delete(q.idem, t.IdemKey)
+	}
 }
 
 // maybeCompact 决定是否重写 journal。两条**独立**的触发线，满足其一即压缩。
@@ -132,6 +217,8 @@ func (q *Queue) snapshot() []store.Record {
 		})
 		switch {
 		case t.State == model.StateSucceeded:
+			// 刻意不带 Resp：响应摘要是排障用的短期信息，它的有用期是事故后
+			// 的几小时，不该跟着墓碑在磁盘上躺满整个保留期。压缩就是它的过期点。
 			out = append(out, store.Record{
 				T: store.RecDone, ID: t.ID, TS: t.UpdatedAt, N: t.Attempts, Code: t.LastCode,
 			})

@@ -2,6 +2,7 @@ package queue
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"testing"
@@ -82,7 +83,7 @@ func TestSubmit_QueueFull(t *testing.T) {
 	if got == nil {
 		t.Fatal("没有到期任务")
 	}
-	if err := q.OnSuccess(got, 200); err != nil {
+	if err := q.OnSuccess(got, 200, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := q.Submit(newTask("after-success")); err != nil {
@@ -181,7 +182,7 @@ func TestRestore_PreservesTerminalAndIdempotency(t *testing.T) {
 	q.Submit(dead)
 	l1, _ := q.Lease(model.NowMS())
 	l2, _ := q.Lease(model.NowMS())
-	if err := q.OnSuccess(l1, 200); err != nil {
+	if err := q.OnSuccess(l1, 200, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := q.OnDead(l2, 400, "bad", "permanent_response"); err != nil {
@@ -256,7 +257,7 @@ func TestPurgeExpired_ClosesIdempotencyWindow(t *testing.T) {
 	tk := newTask("k-expire")
 	q.Submit(tk)
 	leased, _ := q.Lease(model.NowMS())
-	q.OnSuccess(leased, 200)
+	q.OnSuccess(leased, 200, "")
 
 	// 未过期前，幂等键仍然生效。
 	if _, dup, _ := q.Submit(newTask("k-expire")); !dup {
@@ -293,7 +294,7 @@ func TestCompact_RoundTrip(t *testing.T) {
 	l1, _ := q.Lease(model.NowMS())
 	l2, _ := q.Lease(model.NowMS())
 	l3, _ := q.Lease(model.NowMS())
-	q.OnSuccess(l1, 200)
+	q.OnSuccess(l1, 200, "")
 	q.OnDead(l2, 400, "bad request", "permanent_response")
 	nextAt := model.NowMS() + 5000
 	q.OnRetry(l3, 503, "unavailable", nextAt)
@@ -357,7 +358,7 @@ func TestMaybeCompact_TwoIndependentTriggers(t *testing.T) {
 			t.Fatal(err)
 		}
 		leased, _ := q.Lease(model.NowMS())
-		if err := q.OnSuccess(leased, 200); err != nil {
+		if err := q.OnSuccess(leased, 200, ""); err != nil {
 			t.Fatal(err)
 		}
 		return q, w
@@ -443,7 +444,7 @@ func TestMaybeCompact_TwoIndependentTriggers(t *testing.T) {
 		ok.Target.Headers = map[string]string{"Authorization": "Bearer OK-TOKEN"}
 		q.Submit(ok)
 		l2, _ := q.Lease(model.NowMS())
-		q.OnSuccess(l2, 200)
+		q.OnSuccess(l2, 200, "")
 
 		if err := q.maybeCompact(); err != nil {
 			t.Fatal(err)
@@ -472,4 +473,164 @@ func TestMaybeCompact_TwoIndependentTriggers(t *testing.T) {
 			t.Errorf("死信的凭据被误删了: %q —— /retry 将失效", deadCred)
 		}
 	})
+}
+
+// TestPurgeExpired_TieredRetention 验证成功任务与死信用**不同**的保留期。
+//
+// 最初的实现是 `if t.State.Terminal()` 一视同仁，7 天后成功记录和死信一起消失。
+// 而死信代表「有一条通知确实没发出去」，是需要人来处理的证据 —— 和成功记录
+// 同寿没有道理。这个测试防止有人日后"简化"回去。
+func TestPurgeExpired_TieredRetention(t *testing.T) {
+	q, w := newTestQueue(t, t.TempDir())
+	defer w.Close()
+	q.cfg.RetentionMS = 1000      // 成功任务保留 1s
+	q.cfg.DeadRetentionMS = 60000 // 死信保留 60s
+
+	ok := newTask("k-ok")
+	dead := newTask("k-dead")
+	q.Submit(ok)
+	q.Submit(dead)
+	l1, _ := q.Lease(model.NowMS())
+	l2, _ := q.Lease(model.NowMS())
+	q.OnSuccess(l1, 200, `{"ok":true}`)
+	q.OnDead(l2, 400, "bad", "permanent_response")
+
+	// 推进 5 秒：越过成功任务的保留期，但远未到死信的。
+	orig := model.NowMS
+	model.NowMS = func() int64 { return orig() + 5000 }
+	defer func() { model.NowMS = orig }()
+
+	if n := q.purgeExpired(); n != 1 {
+		t.Fatalf("清理数量 = %d, 期望 1（只该清成功任务）", n)
+	}
+	if _, ok := q.Get(l1.ID); ok {
+		t.Error("成功任务已过保留期，应被清理")
+	}
+	if got, exists := q.Get(l2.ID); !exists || got.State != model.StateDead {
+		t.Error("死信保留期未到，不该被清理 —— 它是通知没送达的唯一证据")
+	}
+}
+
+// TestEnforceTaskCap 验证内存总量兜底，以及**牺牲顺序**。
+//
+// QueueMax 只管活跃任务，终态任务会 active--，所以
+// 「提交 N 个 → 全部终结 → 再提交 N 个」可以让 map 一直涨。
+// 这个兜底就是堵那条路（决策 D-017 当初只堵了活跃任务那一条）。
+func TestEnforceTaskCap(t *testing.T) {
+	q, w := newTestQueue(t, t.TempDir())
+	defer w.Close()
+	q.cfg.RetentionMS = 1 << 40 // 关掉按时间清理，隔离出容量逻辑
+	q.cfg.DeadRetentionMS = 1 << 40
+
+	// 3 个成功（时间从旧到新）+ 2 个死信 + 1 个活跃 = 6 个任务。
+	var okIDs, deadIDs []string
+	base := model.NowMS()
+	mk := func(idem string, terminal func(*model.Task), at int64) string {
+		orig := model.NowMS
+		model.NowMS = func() int64 { return at }
+		defer func() { model.NowMS = orig }()
+		tk := newTask(idem)
+		q.Submit(tk)
+		l, _ := q.Lease(at)
+		terminal(l)
+		return l.ID
+	}
+	for i := 0; i < 3; i++ {
+		okIDs = append(okIDs, mk(fmt.Sprintf("ok-%d", i),
+			func(l *model.Task) { q.OnSuccess(l, 200, "") }, base+int64(i)))
+	}
+	for i := 0; i < 2; i++ {
+		deadIDs = append(deadIDs, mk(fmt.Sprintf("dead-%d", i),
+			func(l *model.Task) { q.OnDead(l, 400, "", "permanent_response") }, base+100+int64(i)))
+	}
+	live := newTask("live")
+	q.Submit(live)
+
+	if len(q.tasks) != 6 {
+		t.Fatalf("前置条件：任务数 = %d, 期望 6", len(q.tasks))
+	}
+
+	// 上限设为 4 → 需要清掉 2 个，且必须是**最老的两个成功任务**。
+	q.cfg.TasksMax = 4
+	if n := q.enforceTaskCap(); n != 2 {
+		t.Fatalf("清理数量 = %d, 期望 2", n)
+	}
+	for _, id := range okIDs[:2] {
+		if _, ok := q.Get(id); ok {
+			t.Errorf("最老的成功任务 %s 应被优先清理", id)
+		}
+	}
+	if _, ok := q.Get(okIDs[2]); !ok {
+		t.Error("较新的成功任务不该被清理")
+	}
+	// 死信丢了是永久失去证据，必须排在成功任务之后被牺牲。
+	for _, id := range deadIDs {
+		if _, ok := q.Get(id); !ok {
+			t.Errorf("死信 %s 不该在还有成功任务可清时被牺牲", id)
+		}
+	}
+	// 活跃任务永远不能丢 —— 那是承诺 C1 的范围。
+	if _, ok := q.Get(live.ID); !ok {
+		t.Error("活跃任务被清理了，违反承诺 C1")
+	}
+	if q.cfg.TasksMax = 0; q.enforceTaskCap() != 0 {
+		t.Error("上限为 0 应表示不限制")
+	}
+}
+
+// TestOnSuccess_KeepsResponseAndStripsCredentials 覆盖两件同时发生的事。
+func TestOnSuccess_KeepsResponseAndStripsCredentials(t *testing.T) {
+	dir := t.TempDir()
+	q, w := newTestQueue(t, dir)
+
+	tk := newTask("k-resp")
+	tk.Target.Headers = map[string]string{"Authorization": "Bearer SECRET"}
+	tk.Target.Body = `{"contact_id":1}`
+	q.Submit(tk)
+	l, _ := q.Lease(model.NowMS())
+	// 供应商用 200 包裹业务错误 —— 正是留响应摘要要对付的场景。
+	const body = `{"code":40001,"msg":"contact not found"}`
+	if err := q.OnSuccess(l, 200, body); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _ := q.Get(l.ID)
+	if got.LastResp != body {
+		t.Errorf("响应摘要 = %q, 期望 %q", got.LastResp, body)
+	}
+	// 凭据必须**立刻**离开内存，不等压缩。
+	if got.Target.Headers != nil {
+		t.Errorf("成功后内存中仍持有 Headers: %v", got.Target.Headers)
+	}
+	if got.Target.Body != "" {
+		t.Errorf("成功后内存中仍持有 Body: %q", got.Target.Body)
+	}
+	if got.Target.URL == "" {
+		t.Error("URL 应保留供排障")
+	}
+
+	// 响应摘要要活过重启。
+	w.Close()
+	q2, w2 := newTestQueue(t, dir)
+	defer w2.Close()
+	after, _ := q2.Get(l.ID)
+	if after.LastResp != body {
+		t.Errorf("重启后响应摘要 = %q, 期望 %q", after.LastResp, body)
+	}
+
+	// 但压缩是它的过期点：排障信息的有用期是事故后几小时，
+	// 不该跟着墓碑在磁盘上躺满整个保留期。
+	if err := q2.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	w2.Close()
+	q3, w3 := newTestQueue(t, dir)
+	defer w3.Close()
+	compacted, ok := q3.Get(l.ID)
+	if !ok {
+		t.Fatal("压缩后墓碑丢失")
+	}
+	if compacted.LastResp != "" {
+		t.Errorf("压缩后响应摘要应被丢弃, 仍为 %q", compacted.LastResp)
+	}
 }
