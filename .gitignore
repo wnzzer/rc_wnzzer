@@ -1,0 +1,17 @@
+# 脱敏词表本身含敏感词，永不入库
+scripts/redact-patterns.local
+
+# 构建产物
+/notifyd
+/bin/
+*.exe
+
+# 运行时数据（WAL 日志、快照）
+/data/
+*.log
+*.jsonl
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
